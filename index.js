@@ -1,629 +1,442 @@
-const usb = require('usb');
 const readline = require('readline');
-const readlineInterface = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
-  terminal: false
-});
+const inquirer = require('inquirer');
+const chalk = require('chalk');
+const ora = require('ora');
+const boxen = require('boxen');
+const MsrDevice = require('./lib/MsrDevice');
+const { track1ISOAlphabetInverted } = require('./lib/constants');
 
-const track0ISOAlphabet = Object.fromEntries(Object.entries({
-    '0000001': ' ',
-    '1000000': '!',
-    '0100000': '"',
-    '1100001': '#',
-    '0010000': '$',
-    '1010001': '%',
-    '0110001': '&',
-    '1110000': '\'',
-    '0001000': '(',
-    '1001001': ')',
-    '0101001': '*',
-    '1101000': '+',
-    '0011001': ',',
-    '1011000': '-',
-    '0111000': '.',
-    '1001001': '/',
-    '0000100': '0',
-    '1000101': '1',
-    '0100101': '2',
-    '1100100': '3',
-    '0010101': '4',
-    '1010100': '5',
-    '0110100': '6',
-    '1110101': '7',
-    '0001101': '8',
-    '1001100': '9',
-    '0101100': ':',
-    '1101101': ';',
-    '0011100': '<',
-    '1011101': '=',
-    '0111101': '>',
-    '1111100': '?',
-    '0000010': '@',
-    '1000011': 'A',
-    '0100011': 'B',
-    '1100010': 'C',
-    '0010011': 'D',
-    '1010010': 'E',
-    '0110010': 'F',
-    '1110011': 'G',
-    '0001011': 'H',
-    '1001010': 'I',
-    '0101010': 'J',
-    '1101011': 'K',
-    '0011010': 'L',
-    '1011011': 'M',
-    '0111011': 'N',
-    '1111010': 'O',
-    '0000111': 'P',
-    '1000110': 'Q',
-    '0100110': 'R',
-    '1100111': 'S',
-    '0010110': 'T',
-    '1010111': 'U',
-    '0110111': 'V',
-    '1110110': 'W',
-    '0001110': 'X',
-    '1001111': 'Y',
-    '0101111': 'Z',
-    '1101110': '[',
-    '0011111': '\\',
-    '1011110': ']',
-    '0111110': '^',
-    '1111111': '_',
-}).map(([key, value]) => [parseInt(key, 2).toString(), value]));
+const device = new MsrDevice();
 
-const track0ISOAlphabetInverted = Object.fromEntries(Object.entries(track0ISOAlphabet).map(([key, value]) => [value, parseInt(key)]));
+const runWithCancellation = async (fn) => {
+    readline.emitKeypressEvents(process.stdin);
+    if (process.stdin.isTTY) process.stdin.setRawMode(true);
+    process.stdin.resume();
 
-const track1ISOAlphabet = Object.fromEntries(Object.entries({
-    '00001': '0',
-    '10000': '1',
-    '01000': '2',
-    '11001': '3',
-    '00100': '4',
-    '10101': '5',
-    '01101': '6',
-    '11100': '7',
-    '00010': '8',
-    '10011': '9',
-    '01011': ':',
-    '11010': ';',
-    '00111': '<',
-    '10110': '=',
-    '01110': '>',
-    '11111': '?',
-}).map(([key, value]) => [parseInt(key, 2).toString(), value]));
-
-const track1ISOAlphabetInverted = Object.fromEntries(Object.entries(track1ISOAlphabet).map(([key, value]) => [value, parseInt(key)]));
-
-const lrc = (len, alphabet, data) => {
-    let bits = [];
-    for (let i = 0; i < len; ++i) {
-        bits[i] = 0;
-    }
-    for (let octet of data) {
-        let bin = alphabet[octet.toString()];
-        for (let i = 0; i < len; ++i) {
-            if (bin & (1 << i)) {
-                bits[i] += 1;
-            }
+    const handleKeypress = (str, key) => {
+        if (key.ctrl && key.name === 'c') {
+            if (process.stdin.isTTY) process.stdin.setRawMode(false);
+            process.exit(0);
         }
-    }
-    bits = bits.map(x => x % 2 == 1);
-    bits[0] = bits.slice(1).filter(x => x).length % 2 == 0;
-    let final = 0;
-    for (let i = 0; i < bits.length; ++i) {
-        if (bits[i]) {
-            final |= 1 << i;
+        if (key.name === 'escape') {
+            device.cancel();
         }
-    }
-    return final;
-};
+    };
 
-const parsePacket = hex => {
-    let acc = [];
-    hex.split('').forEach((item, i) => {
-        i % 2 == 0 ? acc.push([item]) : acc[acc.length - 1].push(item);
-    }, []);
-    return acc.map(octSet => parseInt(octSet.join(''), 16));
-}
+    process.stdin.on('keypress', handleKeypress);
 
-const promisify = func => (...args) => new Promise((resolve, reject) => {
     try {
-        func(...args, (...subArgs) => resolve(subArgs));
-    } catch (e) {
-        reject(e);
+        return await fn();
+    } finally {
+        process.stdin.removeListener('keypress', handleKeypress);
+        if (process.stdin.isTTY) process.stdin.setRawMode(false);
     }
-}); 
-
-const sendControlChunk = packet => new Promise((resolve, reject) => {
-    device.controlTransfer(0x21, 9, 0x0300, 0, packet, (error, data) => {
-        if (error != null) {
-            reject(error);
-        }
-        resolve(data);
-    });
-});
-
-const sendControl = async packet => {
-    let written = 0;
-    while (written < packet.length) {
-        let header = 0x80;
-        let len = 0x3F;
-        if (packet.length - written < 0x3F) {
-            header |= 0x40;
-            len = packet.length - written;
-        }
-        header |= len;
-        let chunk = [header, ...packet.slice(written, written + len)];
-        written += len;
-        await sendControlChunk(Buffer.from(chunk));
-    }
-}
-
-const outbound = {
-    'reset': '1b61',
-    'getFirmwareVersion': '1b76',
-    'setBPC': '1b6f',
-    'setHiCo': '1b78',
-    'setLoCo': '1b79',
-    'setBPI': '1b62',
-    'setLeadingZeros': '1b7a',
-    'enableRead': '1b6d',
-    'disableRead': '1b61',
-    'greenLEDOn': '1b83',
-    'redLEDOn': '1b85',
-    'powerOff': '1bac',
-    'getVoltage': '1ba3',
-    'getParameter': '1ba2',
-    'getDeviceModel': '1b74',
-    'setParameter': '1ba1',
-    'enableWrite': '1b6e1b73',
 };
 
-const assemblePacket = (opcode, data = []) => {
-    const opcodeEncoded = parsePacket(outbound[opcode] || opcode);
-    return [...opcodeEncoded, ...data];
+const displayBanner = () => {
+    console.clear();
+    const logo = `
+.___  ___.      _______..______         .___________.  ______     ______    __      
+|   \\/   |     /       ||   _  \\        |           | /  __  \\   /  __  \\  |  |     
+|  \\  /  |    |   (----\`|  |_)  |       \`---|  |----\`|  |  |  | |  |  |  | |  |     
+|  |\\/|  |     \\   \\    |      /            |  |     |  |  |  | |  |  |  | |  |     
+|  |  |  | .----)   |   |  |\\  \\----.       |  |     |  \`--'  | |  \`--'  | |  \`----.
+|__|  |__| |_______/    | _| \`._____|       |__|      \\______/   \\______/  |_______|
+`;
+    console.log(
+        boxen(
+            chalk.cyan(logo),
+            { padding: 1, margin: 1, borderStyle: 'round', borderColor: 'cyan' }
+        )
+    );
+    console.log(chalk.dim('  Magnetic Stripe Reader/Writer CLI Tool\n'));
 };
 
-const connectToDevice = () => {
+const formatTrackData = (data, trackNum) => {
+    if (!data) return chalk.gray('Empty');
+    if (data === 'Corrupt Data') return chalk.red('Corrupt Data');
+    if (data === 'No Data') return chalk.gray('No Data');
+    return chalk.green(data);
+};
 
-    const device =  usb.findByIds(0x0801, 0x0003);
+const handleRead = async () => {
+    const spinner = ora('Waiting for card swipe...').start();
+    try {
+        await runWithCancellation(async () => {
+            await device.sendControl(device.assemblePacket('enableRead'));
+            const { isoTracks, trackData } = await device.readData();
+            spinner.succeed('Card read successfully!');
 
-    device.open();
+            console.log('\n' + boxen(
+                `Track 1: ${formatTrackData(isoTracks[0], 1)}\n` +
+                `Track 2: ${formatTrackData(isoTracks[1], 2)}\n` +
+                `Track 3: ${formatTrackData(isoTracks[2], 3)}`,
+                { title: 'Card Data (ISO)', borderStyle: 'round', padding: 1 }
+            ));
+        });
 
-    console.log(`${device.interfaces.length} interfaces found.`);
-
-    const [ interface ] = device.interfaces;
-
-    if (interface.isKernelDriverActive()) {
-        console.log('detaching device from kernel...');
-        interface.detachKernelDriver();
-        console.log('detached');
-    }
-    interface.claim();
-
-    return { device, interface };
-}
-
-const { device, interface } = connectToDevice();
-let connectedToDevice = true;
-
-function* receivePacket(endpoint) {
-    endpoint.transferType = 2;
-    endpoint.startPoll(1, 64);
-    let currentWaiters = [];
-    let incoming = [];
-    let currentData = [];
-    endpoint.on('data', function (data) {
-        let head = data[0];
-        if ((head & 0x80) != 0x80 && currentData.length == 0) {
-            throw new Error('invalid header byte received');
-        }
-        let length = head & 0x3F;
-        currentData.push(...(data.slice(1, length + 1)));
-        if ((head & 0x40) != 0x40) { // continuation
+        await inquirer.prompt([{ type: 'input', name: 'continue', message: 'Press Enter to continue...' }]);
+    } catch (error) {
+        if (error.message === 'Operation aborted by user') {
+            spinner.stop();
             return;
         }
-
-        if (currentWaiters.length > 0) {
-            currentWaiters.shift()(currentData);
-        } else {
-            incoming.push(currentData);
-        }
-        currentData = [];
-    });
-    endpoint.on('error', function (error) {
-        throw new Error(error);
-    });
-    endpoint.on('end', function (error) {
-        connectedToDevice = false;
-    });
-    while (connectedToDevice) {
-        yield new Promise((resolve) => {
-            if (incoming.length > 0) {
-                resolve(incoming.shift());
-            } else {
-                currentWaiters.push(resolve);
-            }
-        });
-    }
-}
-
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-
-const resetDevice = async () => void 0; // promisify(device.reset.bind(device));
-
-// valid BPIs are 75 & 210
-const deviceConfig = {
-    tracks: [
-        {
-            bpc: 8,
-            bpi: 210,
-        },
-        {
-            bpc: 8,
-            bpi: 75,
-        },
-        {
-            bpc: 8,
-            bpi: 210,
-        },
-    ],
-    leadingZero210: 61,
-    leadingZero75: 22,
-    isHiCo: true,
-};
-
-const toHexString = arr => {
-    let out = [];
-    for (let i of arr) {
-        let c = i.toString(16);
-        while (c.length < 2) {
-            c = `0${c}`;
-        }
-        out.push(c);
-    }
-    return out.join('');
-}
-
-const bitStream = data => {
-    return {
-        raw: data,
-        _bitIndex: 0,
-        read: function(ct) {
-            if (this._bitIndex + ct >= this.raw.length * 8) {
-                return null;
-            }
-            let baseIndex = (this._bitIndex / 8) | 0;
-            let bytes = this.raw.slice(baseIndex, Math.ceil((this._bitIndex + ct) / 8));
-            let value = 0;
-            let bitOffset = this._bitIndex % 8;
-            let bitMask = 0;
-            for (let i = bitOffset; i < Math.min(bitOffset + ct, 8); ++i) {
-                bitMask |= 1 << (7 - i);
-            }
-            value = (bytes[0] & bitMask) >>> Math.max(0, (8 - ct) - bitOffset);
-            for (let i = 1; i < bytes.length - 1; ++i) {
-                value <<= 8;
-                value |= bytes[i];
-            }
-            if (bytes.length > 1) {
-                let remainingBits = ct - (8 - (this._bitIndex % 8)) - Math.max(0, bytes.length - 2) * 8;
-                let bitTrailOffset = remainingBits;
-                value <<= bitTrailOffset;
-                bitMask = 0;
-                for (let i = 0; i < bitTrailOffset; ++i) {
-                    bitMask |= 1 << (7 - i);
-                }
-                value |= (bytes[bytes.length - 1] & bitMask) >>> (8 - bitTrailOffset);
-            }
-            this._bitIndex += ct;
-            return value;
-        },
-        write: function(ct, value) {
-            let bitMask = 0;
-            for (let i = 0; i < ct; ++i) {
-                bitMask |= 0x01 << i;
-            }
-            let toWrite = value & bitMask;
-            let bitOffset = this._bitIndex % 8;
-            let byteOffset = (this._bitIndex / 8) | 0;
-            const rsh = (a1, a2) => a2 >= 0 ? a1 >>> a2 : a1 << -a2;
-            // clear
-            this.raw[byteOffset] &= ~rsh(bitMask, (ct - (8 - bitOffset))) & 0xFF;
-            this.raw[byteOffset] |= rsh(toWrite, (ct - (8 - bitOffset))) & 0xFF;
-            let octetCount = Math.floor((ct - (8 - bitOffset)) / 8);
-            const modifiedBitOffset = (ct - (8 - bitOffset)) % 8;
-            for (let i = byteOffset + octetCount; i >= byteOffset + 1; --i) {
-                this.raw[i] = rsh(toWrite, modifiedBitOffset + (8 * (i - byteOffset - octetCount))) & 0xFF;
-            }
-            if (modifiedBitOffset > 0) {
-                this.raw[byteOffset + octetCount + 1] &= ~(bitMask << (8 - modifiedBitOffset)) & 0xFF;
-                this.raw[byteOffset + octetCount + 1] |= (toWrite << (8 - modifiedBitOffset)) & 0xFF;
-            }
-            this._bitIndex += ct;
-        },
-        seek: function(ct) {
-            this._bitIndex += ct;
-            if (this._bitIndex < 0) {
-                this._bitIndex = 0;
-            } else if (this._bitIndex > this.raw.length * 8) {
-                this._bitIndex = this.raw.length * 8;
-            }
-        }
+        spinner.fail(`Read failed: ${error.message}`);
+        await inquirer.prompt([{ type: 'input', name: 'continue', message: 'Press Enter to continue...' }]);
+    } finally {
+        try { await device.reset(); } catch (e) {}
     }
 };
 
-(async () => {
-    await resetDevice();
-    console.log(`${interface.endpoints.length} endpoints found.`);
+const handleWrite = async () => {
+    const answers = await inquirer.prompt([
+        {
+            type: 'input',
+            name: 'track1',
+            message: 'Enter Track 1 Data (or leave empty):',
+        },
+        {
+            type: 'input',
+            name: 'track2',
+            message: 'Enter Track 2 Data (or leave empty):',
+        },
+        {
+            type: 'input',
+            name: 'track3',
+            message: 'Enter Track 3 Data (or leave empty):',
+        }
+    ]);
 
-    const [ inEndpoint ] = interface.endpoints;
+    const data = [
+        answers.track1 || '',
+        answers.track2 || '',
+        answers.track3 || ''
+    ];
 
-    const reader = receivePacket(inEndpoint);
+    const spinner = ora('Preparing to write...').start();
+
     try {
-        await sendControl(assemblePacket('reset'));
-    } catch (e) {
-        
-    }
-    console.log('Resetting device');
-    const readSuccess = async () => {
-        for (let i = 0; i < 5; ++i) {
-            const received = await reader.next().value;
-            if (received[0] == 0x1B) {
-                if (received[1] == 0x30) {
-                    return true;
-                } else {
-                    await sendControl(assemblePacket('disableRead'));
-                    return false;
+        // Encode data
+        const isoEncoded = [
+            data[0] ? await device.encodeISO(require('./lib/constants').track0ISOAlphabetInverted, 7, data[0]) : [0],
+            data[1] ? await device.encodeISO(track1ISOAlphabetInverted, 5, data[1]) : [0],
+            data[2] ? await device.encodeISO(track1ISOAlphabetInverted, 5, data[2]) : [0],
+        ];
+
+        await runWithCancellation(async () => {
+            spinner.text = 'Please swipe card to WRITE...';
+            
+            let success = false;
+            for (let i = 0; i < 3; i++) {
+                if (await device.writeRawData(isoEncoded)) {
+                    success = true;
+                    break;
                 }
+                spinner.text = `Write failed, retrying (${i + 1}/3)... Swipe again.`;
             }
-        }
-        return false;
-    }
-    const readReturn = async () => {
-        for (let i = 0; i < 5; ++i) {
-            const received = await reader.next().value;
-            if (received != null && received[0] == 0x1B && received[1] != 0x30) {
-                return received.slice(1);
-            }
-        }
-        return null;
-    }
-    while(true) {
-        await sleep(250);
-        try {
-            await sendControl(assemblePacket('getFirmwareVersion'));
-        } catch (e) {
-            continue;
-        }
-        break;
-    }
-    console.log('Requested firmware version');
-    const firmwareReceived = await readReturn();
-    console.log('Received firmware version');
-    const firmwareVersion = Buffer.from(firmwareReceived.slice(1)).toString();
-    console.log(`Firmware Version: ${firmwareVersion}`);
-    let bpc = deviceConfig.tracks.map(track => track.bpc);
-    await sendControl(assemblePacket('setBPC', bpc));
-    await readSuccess();
-    await sendControl(assemblePacket(deviceConfig.isHiCo ? 'setHiCo' : 'setLoCo'));
-    await readSuccess();
-    await sendControl(assemblePacket('setBPI', [deviceConfig.tracks[0].bpi == 210 ? 0xa1 : 0xa0]));
-    await readSuccess();
-    await sendControl(assemblePacket('setBPI', [deviceConfig.tracks[1].bpi == 210 ? 0xc1 : 0xc0]));
-    await readSuccess();
-    await sendControl(assemblePacket('setBPI', [deviceConfig.tracks[2].bpi == 210 ? 0xd2 : 0x4b]));
-    await readSuccess();
-    await sendControl(assemblePacket('setLeadingZeros', [deviceConfig.leadingZero210, deviceConfig.leadingZero75]));
-    await readSuccess();
-    await sendControl(assemblePacket('getVoltage'));
-    const rawVoltage = await readReturn();
-    const voltage = Math.round((rawVoltage[0] + (rawVoltage[1] / 255.0)) * 9.9 / 128.0 * 100.0) / 100.0;
-    console.log(`Voltage: ${voltage}`);
-    await sendControl(assemblePacket('getDeviceModel'));
-    const rawModel = await readReturn();
-    console.log(`Model version: 0x${toHexString(rawModel)}`);
-    console.log('Ready to read.\n');
-    let isReading = false;
-    let isWriting = false;
 
-    const readData = async () => {
-        const received = await reader.next().value;
-        if (received == null || received[0] != 0x1B || received[1] != 0x73) {
-            throw new Error('malformed response from device');
-        }
-        let trackData = [];
-        let rIndex = 2;
-        for (let i = 1; i <= 3; ++i) {
-            if (received[rIndex] != 0x1B || received[rIndex + 1] != i) {
-                throw new Error('malformed response from device');
-            }
-            rIndex += 2;
-            const trackLength = received[rIndex];
-            ++rIndex;
-            trackData.push(received.slice(rIndex, rIndex + trackLength));
-            rIndex += trackLength;
-        }
-        console.log('Incoming read: [RAW]');
-        console.log(trackData.map((track, i) => `Track ${i + 1}: ${toHexString(track)}`).join('\n'));
-        const isoDecoded = [[], [], []];
-        let track0Stream = bitStream(trackData[0]);
-        let temp = null;
-        while ((temp = track0Stream.read(7)) != null) {
-            isoDecoded[0].push(track0ISOAlphabet[temp.toString()] || '~');
-        }
-        let track1Stream = bitStream(trackData[1]);
-        while ((temp = track1Stream.read(5)) != null) {
-            isoDecoded[1].push(track1ISOAlphabet[temp.toString()] || '~');
-        }
-        let track2Stream = bitStream(trackData[2]);
-        while ((temp = track2Stream.read(5)) != null) {
-            isoDecoded[2].push(track1ISOAlphabet[temp.toString()] || '~');
-        }
-        let isoTracks = isoDecoded.map(track => track.join(''));
-
-        for (let i = 0; i < isoTracks.length; ++i) {
-            let endIndex = isoTracks[i].indexOf('?');
-            let startIndex = isoTracks[i].indexOf(';');
-            if (startIndex < 0 || endIndex < 0) {
-                isoTracks[i] = isoTracks[i].length > 0 ? 'Corrupt Data' : 'No Data';
+            if (success) {
+                spinner.succeed('Card written successfully!');
             } else {
-                isoTracks[i] = isoTracks[i].slice(startIndex, endIndex + 1);
-                if (isoTracks[i].includes('~')) {
-                    isoTracks[i] = 'Corrupt Data';
-                }
+                spinner.fail('Failed to write after multiple attempts.');
             }
+        });
+    } catch (error) {
+        if (error.message === 'Operation aborted by user') {
+            spinner.stop();
+            return;
         }
-        let track0Checksum = lrc(7, track0ISOAlphabetInverted, isoTracks[0].split(''));
-        let track1Checksum = lrc(5, track1ISOAlphabetInverted, isoTracks[1].split(''));
-        let track2Checksum = lrc(5, track1ISOAlphabetInverted, isoTracks[2].split(''));
-        //TODO: validate checksums
-        console.log('Incoming read: [ISO]');
-        console.log(isoTracks.map((track, i) => `Track ${i + 1}: ${track}`).join('\n'));
-        return { isoTracks, trackData };
+        spinner.fail(`Write Error: ${error.message}`);
+    } finally {
+        await device.reset();
+        await inquirer.prompt([{ type: 'input', name: 'continue', message: 'Press Enter to continue...' }]);
+    }
+};
+
+const handleClone = async () => {
+    const readSpinner = ora('Waiting for source card swipe...').start();
+    let sourceData = null;
+
+    try {
+        await runWithCancellation(async () => {
+            await device.sendControl(device.assemblePacket('enableRead'));
+            const result = await device.readData();
+            sourceData = result.trackData; // Use raw track data for exact clone
+            readSpinner.succeed('Source card read!');
+        });
+    } catch (error) {
+        if (error.message === 'Operation aborted by user') {
+            readSpinner.stop();
+            return;
+        }
+        readSpinner.fail(`Read failed: ${error.message}`);
+        await device.reset();
+        await inquirer.prompt([{ type: 'input', name: 'continue', message: 'Press Enter to continue...' }]);
+        return;
     }
 
-    process.on('SIGINT', function() {    
-        if (isReading || isWriting) {
-            sendControl(assemblePacket('disableRead')).then(() => {
-                isReading = false;
-                isWriting = false;
-                process.exit();
-            });
-        } else {
-            process.exit();
-        }
-    });
+    console.log(chalk.yellow('\nRemove source card and prepare target card.\n'));
+    await inquirer.prompt([{ type: 'input', name: 'continue', message: 'Press Enter when ready to WRITE...' }]);
 
-    const writeRawData = async data => {
-        const tracks = data.map(track => track.map(octet => {
-            let bits = [octet & 0x80, octet & 0x40, octet & 0x20, octet & 0x10, octet & 0x08, octet & 0x04, octet & 0x02, octet & 0x01].map(bit => bit != 0);
-            let value = 0;
-            let currentBit = 0x80;
-            for(let i = bits.length - 1; i >= 0; --i) {
-                if (bits[i]) {
-                    value |= currentBit;
+    const writeSpinner = ora('Please swipe target card to WRITE...').start();
+    try {
+        await runWithCancellation(async () => {
+            let success = false;
+            for (let i = 0; i < 3; i++) {
+                if (await device.writeRawData(sourceData)) {
+                    success = true;
+                    break;
                 }
-                currentBit /= 2;
+                writeSpinner.text = `Write failed, retrying (${i + 1}/3)... Swipe again.`;
             }
-            return value;
-        }));
-        const outData = [0x1b, 0x01, tracks[0].length, ...tracks[0], 0x1b, 0x02, tracks[1].length, ...tracks[1], 0x1b, 0x03, tracks[2].length, ...tracks[2], 0x3F, 0x1C];
-        isWriting = true;
-        await sendControl(assemblePacket('enableWrite', outData));
-        const success = await readSuccess();
-        isWriting = false;
-        console.log(success ? 'Written successfully' : 'Failed to write');
-        return success;
-    };
 
-    const encodeISO = async (map, length, track) => {
-        const output = [];
-        const outStream = bitStream(output);
-        track.split('').map(c => map[c] || c).forEach(c => {
-            if (typeof c == 'string') {
-                throw new Error('invalid character in track: ' + c);
+            if (success) {
+                writeSpinner.succeed('Card cloned successfully!');
+            } else {
+                writeSpinner.fail('Failed to write clone after multiple attempts.');
             }
-            outStream.write(length, c);
         });
-        if (track.length > 0) {
-            outStream.write(length, lrc(length, map, track.split('')));
+    } catch (error) {
+        if (error.message === 'Operation aborted by user') {
+            writeSpinner.stop();
+            return;
         }
-        return output;
-    };
+        writeSpinner.fail(`Write Error: ${error.message}`);
+    } finally {
+        await device.reset();
+        await inquirer.prompt([{ type: 'input', name: 'continue', message: 'Press Enter to continue...' }]);
+    }
+};
 
-    readlineInterface.on("line", async line => {
-        let endOfCommand = line.indexOf(" ");
-        if (endOfCommand < 0) {
-            endOfCommand = line.length;
+const handleValidate = async () => {
+    const masterSpinner = ora('Waiting for MASTER card swipe...').start();
+    let masterTracks = null;
+
+    try {
+        await runWithCancellation(async () => {
+            await device.sendControl(device.assemblePacket('enableRead'));
+            const { isoTracks } = await device.readData();
+            masterTracks = isoTracks;
+            masterSpinner.succeed('Master card captured!');
+            
+            console.log(boxen(
+                `Track 1: ${formatTrackData(masterTracks[0], 1)}\n` +
+                `Track 2: ${formatTrackData(masterTracks[1], 2)}\n` +
+                `Track 3: ${formatTrackData(masterTracks[2], 3)}`,
+                { title: 'Master Data', borderStyle: 'round', padding: 1, borderColor: 'yellow' }
+            ));
+        });
+
+    } catch (error) {
+        if (error.message === 'Operation aborted by user') {
+            masterSpinner.stop();
+            return;
         }
-        const command = line.substring(0, endOfCommand).trim();
-        const arg = endOfCommand >= line.length ? '' : line.substring(endOfCommand + 1).trim();
-        if (command == 'read') {
-            isReading = true;
-            await sendControl(assemblePacket('enableRead'));
-            await readData();
-            isReading = false;
-            // read is disabled
-        } else if (command == 'read_cycle') {
-            while (true) {
-                isReading = true;
-                await sendControl(assemblePacket('enableRead'));
-                await readData();
-            }
-        } else if (command == 'write_raw') {
-            const data = arg.split(' ').map(datum => datum == 'none' || datum == 'null' ? '' : datum);
-            if (data.length != 3) {
-                console.log('invalid data, need 3 tracks, space delimited');
-                return;
-            }
-            await writeRawData(data.map(packet => parsePacket(packet)));
-        } else if (command == 'clone') {
-            isReading = true;
-            await sendControl(assemblePacket('enableRead'));
-            const { trackData } = await readData();
-            isReading = false;
+        masterSpinner.fail(`Read failed: ${error.message}`);
+        await device.reset();
+        await inquirer.prompt([{ type: 'input', name: 'continue', message: 'Press Enter to continue...' }]);
+        return;
+    }
 
-            for (let i = 0; i < 5; ++i) {
-                if (await writeRawData(trackData)) {
+    console.log(chalk.cyan('\nNow swipe cards to validate against the Master. Press ESC to stop.\n'));
+
+    const spinner = ora('Waiting for card swipe...').start();
+
+    await runWithCancellation(async () => {
+        while (true) {
+            try {
+                await device.sendControl(device.assemblePacket('enableRead'));
+                
+                // Wait for data
+                const { isoTracks } = await device.readData();
+
+                // Clear the "Waiting..." spinner so we can print the result cleanly
+                spinner.stop();
+
+                const isMatch = 
+                    isoTracks[0] === masterTracks[0] &&
+                    isoTracks[1] === masterTracks[1] &&
+                    isoTracks[2] === masterTracks[2];
+
+                if (isMatch) {
+                    spinner.succeed(chalk.green.bold('MATCH VALIDATED ✅'));
+                } else {
+                    spinner.fail(chalk.red.bold('MISMATCH DETECTED ❌'));
+                    console.log(boxen(
+                        `Track 1: ${isoTracks[0] === masterTracks[0] ? chalk.green('MATCH') : chalk.red('MISMATCH')}\n` +
+                        `Track 2: ${isoTracks[1] === masterTracks[1] ? chalk.green('MATCH') : chalk.red('MISMATCH')}\n` +
+                        `Track 3: ${isoTracks[2] === masterTracks[2] ? chalk.green('MATCH') : chalk.red('MISMATCH')}`,
+                        { title: 'Validation Details', borderStyle: 'round', padding: 1, borderColor: 'red' }
+                    ));
+                }
+                
+                // Short delay to let the user see the result before "Waiting..." appears again
+                await new Promise(r => setTimeout(r, 1500));
+                // check running again after sleep in case ESC was pressed
+                spinner.start('Waiting for card swipe...');
+
+            } catch (error) {
+                if (error.message === 'Operation aborted by user') {
                     break;
                 }
-                console.log(`Attempt #${i + 1}/5 failed, try again.`);
-            }
-        } else if (command == 'write_iso') {
-            const data = arg.split('~').map(datum => datum == 'none' || datum == 'null' ? '' : (datum == 'erase' ? '\0' : datum));
-            if (data.length != 3) {
-                console.log('invalid data, need 3 tracks, ~ delimited');
-                return;
-            }
-            const isoEncoded = [
-                data[0] == '\0' ? [0] : await encodeISO(track0ISOAlphabetInverted, 7, data[0]),
-                data[1] == '\0' ? [0] : await encodeISO(track1ISOAlphabetInverted, 5, data[1]),
-                data[2] == '\0' ? [0] : await encodeISO(track1ISOAlphabetInverted, 5, data[2]),
-            ];
-            for (let i = 0; i < 5; ++i) {
-                if (await writeRawData(isoEncoded)) {
+                
+                // If we are still running, show error and restart spinner
+                spinner.fail(`Read error: ${error.message}`);
+                if (error.message.includes('disconnected')) {
                     break;
                 }
-                console.log(`Attempt #${i + 1}/5 failed, try again.`);
+                await new Promise(r => setTimeout(r, 1000));
+                spinner.start('Waiting for card swipe...');
             }
-        } else if (command == 'write_script') {
-            script = require(arg);
-            for (let write of script.getISOWrites()) {
-                if (write.trim().length == 0) {
-                    return;
-                }
-                console.log('Script writing: ' + write.trim());
-                const data = write.trim().split('~').map(datum => datum == 'none' || datum == 'null' ? '' : (datum == 'erase' ? '\0' : datum));
-                if (data.length != 3) {
-                    console.log('invalid data, need 3 tracks, ~ delimited');
-                    return;
-                }
-                const isoEncoded = [
-                    data[0] == '\0' ? [0] : await encodeISO(track0ISOAlphabetInverted, 7, data[0]),
-                    data[1] == '\0' ? [0] : await encodeISO(track1ISOAlphabetInverted, 5, data[1]),
-                    data[2] == '\0' ? [0] : await encodeISO(track1ISOAlphabetInverted, 5, data[2]),
-                ];
-                for (let i = 0; i < 5; ++i) {
-                    if (await writeRawData(isoEncoded)) {
-                        break;
-                    }
-                    console.log(`Attempt #${i + 1}/5 failed, try again.`);
-                }
-            }
-        } else {
-            console.log(`Invalid command: ${command}`);
-            console.log('Valid commands:');
-            console.log('* read -- prepare the card reader to read a card, outputs in Raw and ISO');
-            console.log('* read_cycle -- read repeatedly until execution halts');
-            console.log('* write_raw -- prepare to write a raw hex stream to the card. usage: write_raw track1/none track2/none track3/none');
-            console.log('* clone -- prepare to read a card, and upon read success, prepare to write another card with raw equivalent data');
-            console.log('* write_iso -- prepare to write ISO data to a card, usage: write_iso track1/none~track2/none~track3/none');
-            console.log('* write_script -- enables write_iso macro to be loaded');
         }
     });
     
-    console.log('Initialized Device');
+    // Cleanup
+    if (spinner.isSpinning) spinner.stop();
+    try { await device.reset(); } catch (e) {}
+};
+
+const handleClear = async () => {
+    const confirm = await inquirer.prompt([{
+        type: 'confirm',
+        name: 'sure',
+        message: 'Are you sure you want to ERASE all data on the card?',
+        default: false
+    }]);
+
+    if (!confirm.sure) return;
+
+    const spinner = ora('Preparing to erase...').start();
+    try {
+        // Empty raw packets usually imply erasure or writing nulls depending on how writeRawData handles it
+        // The original code handled 'erase' by sending null bytes or specific erase patterns.
+        // Let's assume sending valid but empty ISO structures effectively clears it or we can try writing 0s.
+        // The original code: data[0] == '\0' ? [0] : ...
+        // So we send [0] for each track.
+        const emptyEncoded = [[0], [0], [0]];
+
+        await runWithCancellation(async () => {
+            spinner.text = 'Swipe card to ERASE...';
+            
+            let success = false;
+            for (let i = 0; i < 3; i++) {
+                if (await device.writeRawData(emptyEncoded)) {
+                    success = true;
+                    break;
+                }
+                spinner.text = `Erase failed, retrying (${i + 1}/3)... Swipe again.`;
+            }
+
+            if (success) {
+                spinner.succeed('Card erased successfully!');
+            } else {
+                spinner.fail('Failed to erase after multiple attempts.');
+            }
+        });
+    } catch (error) {
+        if (error.message === 'Operation aborted by user') {
+            spinner.stop();
+            return;
+        }
+        spinner.fail(`Erase Error: ${error.message}`);
+    } finally {
+        await device.reset();
+        await inquirer.prompt([{ type: 'input', name: 'continue', message: 'Press Enter to continue...' }]);
+    }
+};
+
+const mainMenu = async () => {
+    while (true) {
+        displayBanner();
+        
+        if (!device.connected) {
+            console.log(chalk.yellow('Connecting to device...'));
+            try {
+                await device.connect();
+                console.log(chalk.green('Device Connected!'));
+                await new Promise(r => setTimeout(r, 1000));
+            } catch (e) {
+                if (e.message === 'ACCESS_DENIED') {
+                    console.log(chalk.red('\nERROR: Could not access device.'));
+                    console.log(chalk.yellow('This typically means Windows has locked the device driver.'));
+                    console.log(boxen(
+                        'SOLUTION: You must install the WinUSB driver using Zadig.\n' +
+                        '1. Download Zadig from https://zadig.akeo.ie/\n' +
+                        '2. Open Zadig, select "Options" -> "List All Devices"\n' +
+                        '3. Select "MSR605X" (or USB Input Device 0801:0003)\n' +
+                        '4. Ensure target driver is "WinUSB" and click "Replace Driver"\n' +
+                        '5. Unplug and replug the device.',
+                        { padding: 1, borderStyle: 'double', borderColor: 'yellow' }
+                    ));
+                    // Wait longer before retrying to let user read
+                    await new Promise(r => setTimeout(r, 10000));
+                } else {
+                    console.log(chalk.red(`Failed to connect: ${e.message}`));
+                    console.log(chalk.dim('Retrying in 2 seconds...'));
+                    await new Promise(r => setTimeout(r, 2000));
+                }
+                continue;
+            }
+        }
+
+        const { action } = await inquirer.prompt([
+            {
+                type: 'list',
+                name: 'action',
+                message: 'What would you like to do?',
+                choices: [
+                    { name: '📖  Read Card', value: 'read' },
+                    { name: '✍️   Write Card', value: 'write' },
+                    { name: '👯  Clone Card', value: 'clone' },
+                    { name: '✅  Validate Cards', value: 'validate' },
+                    { name: '🧹  Clear Card', value: 'clear' },
+                    new inquirer.Separator(),
+                    { name: '❌  Exit', value: 'exit' }
+                ]
+            }
+        ]);
+
+        if (action === 'exit') {
+            console.log(chalk.blue('Goodbye!'));
+            process.exit(0);
+        }
+
+        switch (action) {
+            case 'read':
+                await handleRead();
+                break;
+            case 'write':
+                await handleWrite();
+                break;
+            case 'clone':
+                await handleClone();
+                break;
+            case 'validate':
+                await handleValidate();
+                break;
+            case 'clear':
+                await handleClear();
+                break;
+        }
+    }
+};
+
+// Handle Ctrl+C gracefully
+process.on('SIGINT', async () => {
+    if (device) {
+        device.cancel();
+        try { await device.reset(); } catch (e) {}
+    }
+    console.log('\n' + chalk.blue('Goodbye!'));
+    process.exit(0);
+});
+
+// Start the application
+(async () => {
+    try {
+        await mainMenu();
+    } catch (e) {
+        console.error('Fatal Error:', e);
+        process.exit(1);
+    }
 })();
